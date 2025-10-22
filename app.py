@@ -13,6 +13,8 @@ from datetime import datetime
 from PIL import Image
 from io import StringIO, BytesIO
 
+
+
 # Flask essentials and extensions
 from flask import Flask, render_template, request, redirect, url_for, session, flash, Response, send_file
 from supabase import create_client, Client
@@ -211,13 +213,29 @@ def login():
         password = request.form["password"]
 
         try:
-            res = supabase.table("users").select("*").eq("email", email).limit(1).execute()
-            user_data = res.data[0] if res.data else None
+            # --- STEP 1: Securely Verify Password via Supabase Auth ---
+            # This handles hashing verification against the auth.users table.
+            auth_response = supabase.auth.sign_in_with_password({
+                "email": email,
+                "password": password
+            })
             
-            # WARNING: Insecure password check - replace with hashed password check in production!
-            if user_data and user_data['password'] == password: 
+            # Check if authentication was successful
+            if auth_response.user:
+                user_id = auth_response.user.id
+                
+                # --- STEP 2: Fetch Role and Name from your custom public.users table ---
+                # This fetches the metadata (role, name) associated with the secure UUID.
+                user_res = supabase.table("users").select("*").eq("id", user_id).single().execute()
+                user_data = user_res.data
+                
+                if not user_data:
+                    flash("Login failed: User profile data missing. Contact admin.", "danger")
+                    return redirect(url_for("login"))
+
+                # --- STEP 3: Create Session and Redirect ---
                 session["user"] = {
-                    "id": user_data['id'],
+                    "id": user_id,
                     "name": user_data.get('name', user_data['email']),
                     "email": user_data['email'],
                     "role": user_data['role']
@@ -226,12 +244,14 @@ def login():
                 if user_data['role'] == "system_admin":
                     return redirect(url_for("admin_dashboard"))
                 else:
-                    # Using the renamed endpoint for consistency
                     return redirect(url_for("doctor_dashboard")) 
             else:
+                # This block is often hit on general sign_in_with_password failures
                 flash("Invalid email or password.", "danger")
+                
         except Exception as e:
-            flash("Login error. Please try again.", "danger")
+            # Handles API errors, network issues, and general auth failures
+            flash("Login error. Please check credentials or try again.", "danger")
             print(f"LOGIN ERROR: {e}")
             
     return render_template("login.html")
@@ -388,6 +408,7 @@ def save_core_settings():
 
 @app.route("/add_user", methods=["POST"])
 def add_user():
+    # Only Admin can create users
     if "user" not in session or session["user"]["role"] != "system_admin":
         flash("Unauthorized access!", "danger")
         return redirect(url_for("login"))
@@ -402,15 +423,46 @@ def add_user():
         return redirect(url_for("admin_dashboard"))
 
     try:
+        # --- CRITICAL FIX: Use Supabase Auth Admin API for secure hashing ---
+        
+        # 1. Securely create the user in the built-in auth.users table. 
+        # Supabase handles the bcrypt hashing automatically.
+        auth_res = supabase.auth.admin.create_user(
+            {
+                "email": email,
+                "password": password,
+                "email_confirm": True, # Automatically confirms user for immediate login
+            }
+        )
+        user_id = auth_res.user.id
+
+        # 2. Insert the non-auth metadata (Name, Role) into your custom public.users table.
+        # This links the application data to the secure auth ID (UUID).
         supabase.table("users").insert({
+            "id": user_id,  # Link the record to the auth.users UUID
             "name": name,
             "email": email,
-            "password": password,
-            "role": role
+            "role": role,
+            # IMPORTANT: The password field is NOT included here, only the metadata.
         }).execute()
-        flash("User added successfully!", "success")
+
+        flash("User added and password securely hashed!", "success")
+        
     except Exception as e:
-        flash(f"Error adding user: {str(e)}", "danger")
+        error_message = str(e)
+        # Check for specific Supabase errors (e.g., duplicate email)
+        if "users_email_key" in error_message or "duplicate key" in error_message:
+             flash("Error: A user with this email already exists.", "danger")
+        else:
+             # Attempt to delete the user from auth.users if the metadata insert failed
+             try:
+                 if 'auth_res' in locals() and user_id:
+                     supabase.auth.admin.delete_user(user_id)
+             except:
+                 pass # Ignore if delete fails
+                 
+             flash(f"Error adding user: {error_message}", "danger")
+             print(f"ADD USER ERROR: {e}")
 
     return redirect(url_for("admin_dashboard"))
 
